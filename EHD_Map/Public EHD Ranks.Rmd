@@ -1,0 +1,257 @@
+---
+title: "Public EHD Ranks"
+author: "EHD Map Team, Zoe Schneider"
+date: "2026-07-08"
+output: html_document
+---
+
+This script replicates our EHD map ranking methodology. To learn more about the EHD map please visit our Environmental Health Disparities Map website. If this is your first time running this script it may be helpful to keep the following in mind:
+
+1. To create the EHD map ranks, we rank individual data measures --> then we group measures into larger themes and create theme level ranks --> and then we roll up all themes to create an overall level rank. The metadata defined in the "data needed" step defines these relationships between measures and themes. 
+
+2.  This script pulls the published data from the Washington Geospatial Data Portal. Your calculated rankings with this data will be different for measures where the final published data is censored to protect patient confideniality. This includes Death from Cardiovascular Disease and Low Birth Weight, where census tracts with counts under 10 are used to calculate the rankings but are censored in the published data. If you want to re-create the rankings with the full data, please reach out to our team, and we are happy to run that analysis for you. 
+
+If you have any questions please feel free to reach out to our team at: EHDMap@doh.wa.gov.
+
+#Setting Up:
+
+##Packages needed:
+If you open this file in R and click "save", you should get a pop-up at the top of your screen that asks if you want to install any of these packages that aren't already installed on your computer. 
+```{r}
+library(tidyverse) #For data processing
+library(readr) #To read CSV files more easily
+library(sf) #Additional spatial functions
+
+library(openxlsx) #work with excel files
+
+library(ggplot2) #making plots
+library(psych) #creates correlation analysis pairs
+
+library(geojsonsf) #for pulling data from the geodataportal
+library(COINr) #For creating ranks
+
+library(tmap) #make pretty maps
+library(RColorBrewer) #color options for maps
+
+#Disables scientific notation to avoid weird formatting
+options(scipen = 999)
+```
+
+##Data needed
+```{r}
+#Pulling file from the API: 
+full_ehd_file <- geojson_sf("https://services8.arcgis.com/rGGrs6HCnw87OFOT/arcgis/rest/services/Full_Extract_Environmental_Health_Disparities_Map_Version3/FeatureServer/0/query?outFields=*&where=1%3D1&f=geojson") %>% 
+  st_transform(9003) %>% 
+  st_make_valid() 
+
+#Filtering the file to just measures and census tract ID (renamed to uCode for coinR naming conventions)
+measures <- full_ehd_file %>% 
+  st_drop_geometry() %>% 
+  mutate(uCode = as.character(CensusTract2020)) %>% 
+  select(!contains("Rank")) %>% 
+  select(!contains("Theme")) %>% 
+  select(!contains("Shape")) %>% 
+  select(-TribalTracts, -HighlyImpacted, -OBJECTID, -CensusTract2020) %>% 
+  mutate(across(all_of(c("CardiovascularDisease_new", "LowBirthWeight_new")), as.numeric))
+
+#Defining all the metadata to determine how measures are averaged together to get a composite score. 
+meta <- rbind(
+              c("ehd", "EHD Ranking", 1, 1, NA, 4, "Aggregate"),
+              c("population", "Population Characteristics", 1, 1, "ehd", 3, "Aggregate"),
+              c("pollution", "Pollution Burden", 1, 1, "ehd", 3, "Aggregate"),
+              c("env_effects", "Environmental Effects", 1, 0.5, "pollution", 2, "Aggregate"),
+              c("env_expos", "Environmental Exposures", 1, 1, "pollution", 2, "Aggregate"),
+              c("sens_pop", "Sensitive Populations", 1, 1, "population", 2, "Aggregate"),
+              c("SES", "Socioeconomic Factors", 1, 1, "population", 2, "Aggregate"),
+              c("Lead_Risk", "Lead Risk From Housing", 1, 1, "env_effects", 1, "Indicator"),
+              c("Hazardous_Waste", "Proximity to Hazardous Waste Sites", 1, 1, "env_effects", 1, "Indicator"),
+              c("Superfund_Sites", "Proximity to Superfund Sites", 1, 1, "env_effects", 1, "Indicator"),
+              c("Risk_Management_Plan", "Proximity to Risk Management Plan Sites", 1, 1, "env_effects", 1, "Indicator"),
+              c("Water_Quality", "Water Quality", 1, 1, "env_effects", 1, "Indicator"),
+              c("Wastewater_Discharge", "Wastewater Discharge", 1, 1, "env_effects", 1, "Indicator"),
+              c("Ozone", "Ozone Concentration", 1, 1, "env_expos", 1, "Indicator"),
+              c("PM2_5", "PM 2.5 Concentration", 1, 1, "env_expos", 1, "Indicator"),
+              c("Pesticide", "Pesticide Concentration", 1, 1, "env_expos", 1, "Indicator"),
+              c("Heavy_Traffic_Roadways", "Proximity to Heavy Traffic Roadways", 1, 1, "env_expos", 1, "Indicator"),
+              c("Diesel_AirToxics", "Cancer Risk from Diesel and other air toxics", 1, 1, "env_expos", 1, "Indicator"),
+              c("Wildfire_Smoke", "Wildfire Smoke Score", 1, 1, "env_expos", 1, "Indicator"),
+              c("CardiovascularDisease_new", "Death from Cardiovascular Disease", 1, 1, "sens_pop", 1, "Indicator"),
+              c("LowBirthWeight_new", "Low Birth Weight", 1, 1, "sens_pop", 1, "Indicator"),
+              c("Respiratory_Disease", "Air Quality-Related Respiratory Disease", 1, 1, "sens_pop", 1, "Indicator"),
+              c("Primary_Language", "Primary Language Other Than English", 1, 1, "SES", 1, "Indicator"),
+              c("No_HS_Diploma", "No High School Diploma", 1, 1, "SES", 1, "Indicator"),
+              c("POC", "People of Color", 1, 1, "SES", 1, "Indicator"),
+              c("Poverty", "Poverty  <=185% of FPL", 1, 1, "SES", 1, "Indicator"),
+              c("Transportation_Expense", "Transportation Expense", 1, 1, "SES", 1, "Indicator"),
+              c("Unaffordable_Housing", "Unaffordable Housing", 1, 1, "SES", 1, "Indicator"),
+              c("Unemployment", "Unemployment", 1, 1, "SES", 1, "Indicator"),
+              c("Digital_Infrastructure", "Digital Infrastructure", 1, 1, "SES", 1, "Indicator"),
+              c("Food_Environment", "Community Retail Food Environment", -1, 1, "SES", 1, "Indicator"),
+              c("Disability", "Population with a Disability", 1, 1, "sens_pop", 1, "Indicator")
+              ) %>% 
+  as.data.frame() %>% 
+  rename_with(~c("iCode", "iName", "Direction", "Weight", "Parent", "Level", "Type")) %>% 
+  mutate(across(all_of(c("Direction", "Weight", "Level")), as.numeric))
+```
+
+##Helper functions
+
+```{r}
+#make binned ranks (default=deciles)
+n_brank <- function (x, ties.method = "min", nranks=10) 
+{
+  stopifnot(is.numeric(x))
+  rx <- rank(x, ties.method = "min", na.last = "keep")
+  rx <- (rx / floor(sum(!is.na(rx))/nranks)) %>% ceiling
+  rx[which(rx>nranks)] <- nranks #cap the ranks at nranks (dont turn up to 11)
+  return(rx)
+}
+
+n_brank_max <- function (x, ties.method = "max", nranks=10) 
+{
+  stopifnot(is.numeric(x))
+  rx <- rank(x, ties.method = "max", na.last = "keep")
+  rx <- (rx / floor(sum(!is.na(rx))/nranks)) %>% ceiling
+  rx[which(rx>nranks)] <- nranks #cap the ranks at nranks (dont turn up to 11)
+  return(rx)
+}
+
+#Process coin to get data table - this function re-normalizes the themes and overall rank; note that if you change the order of the data you may need to check this still works correctly: 
+process_coin <- function(coin1) {
+  df <- coin1$Data$Aggregated %>% as.data.frame %>% 
+    mutate(across(env_effects:ehd, n_brank))
+}
+
+```
+
+#Creating ranks using COINr:
+
+##Defining alterations to normalization process:
+Note: the community food retail environment is the only variable where ranks are assigned starting from 10, as opposed to starting from 1. This is because there are a large number of census tracts that have no proximity to nutritional food options, and this method of ranking ensures all these census tracts are assigned a ranking of 10 instead of all being assigned a 7 or 8. 
+
+```{r}
+#Creates a custom function to not apply normalization to variables that are already normalized in excel (ie. PM 2.5 and ozone)
+no_norm <- function (x) 
+{
+  return(x)
+}
+
+#Custom ranking for ozone - ranks are linear based on ozone concentration
+ozone_cat <- function(x) {
+  rx <- case_when(
+    x < 47 ~ 1,
+    x < 50 ~ 2,
+    x < 53 ~ 3,
+    x < 56 ~ 4,
+    x < 59 ~ 5,
+    x < 62 ~ 6,
+    x < 65 ~ 7,
+    x < 68 ~ 8,
+    x < 71 ~ 9,
+    x > 70 ~ 10
+  )
+  return(rx)
+}
+
+#Custom specs: 
+custom_specs <- list(
+  ozone = list(f_n = "ozone_cat"), #Ozone is ranked using equal breaks instead of deciles.
+  pm25 = list(f_n = "no_norm"), #PM 2.5 is created by averaging the normalized values for the daily and annual peak PM 2.5 values, then normalizing that data using equal breaks instead of deciles. We will preserve that existing normalization. 
+  food = list(f_n = "n_brank_max") #Reverses direction of ranking in order to keep all sites with 0 food access as 10s
+)
+```
+
+##Build coin:
+
+```{r}
+#build coin
+ehd_coin <- new_coin(iData = measures,
+                 iMeta = meta,
+                 level_names = c("Indicator", "Pillar", "Sub-index", "Index"))
+
+#normalize the data distribution by decile ranking
+ehd_coin <- Normalise(ehd_coin, dset = "Raw",
+                  global_specs=list(f_n='n_brank'),
+                  indiv_specs = custom_specs)
+
+#aggregate using base function to compare to our results
+ehd_coin <- Aggregate(ehd_coin, dset = "Normalised", 
+                  w='Original',
+                  flatten_hierarchy = F,
+                  #note that we take the arith mean until the last aggregation, where we multiply for risk score
+                  f_ag = c("a_amean", "a_amean", "prod")) 
+
+```
+
+##Examine data:
+In this  step, we can double check the relationships between data to ensure the weights and variable organization is correct. These graphs are useful for understanding how each of the measures fit together in calculating the final score. 
+```{r}
+#Visualizing the weight/organization of variables within the model:
+plot_framework(ehd_coin)
+plot_framework(ehd_coin, type = "stack", colour_level = 2)
+
+```
+
+
+##Final data processing: 
+This code adds back in the spatial data for mapping, normalizes the calculated themes and index, and re-names the final columns to that the ranked data includes _rank at the end. This is useful if you want to join the original raw data to this file. 
+```{r}
+ehd_ranks <- full_ehd_file %>% 
+                select(CensusTract2020, TribalTracts) %>% 
+                mutate(CensusTract2020 = as.character(CensusTract2020)) %>% #Re-adding spatial data for mapping
+  left_join(ehd_coin %>% process_coin() %>% rename_with(.fn = ~paste0(.x, "_rank")) , #Normalizing the themes and index to ensure all the ranked data is on the 1 to 10 scale and rename these variables to include "_rank" at the end
+            by = c("CensusTract2020" = "uCode_rank")) 
+```
+
+#Data Visualizations: 
+```{r}
+#Text based table looking at the correlation between all variables:
+full_correlation <- as.data.frame(cor(measures %>% select(-uCode), use = "complete.obs"))
+print(full_correlation)
+
+#Visualizing correlation between all raw data:
+plot_corr(ehd_coin, dset = "Raw", iCodes = list("ehd"), Levels = 1)
+
+#correlation between ranked variables: 
+plot_corr(ehd_coin, dset = "Normalised", iCodes = list("ehd"), Levels = 1)
+```
+
+##Making Maps: 
+```{r}
+#Example code to create a map of any ranked data using tmap: 
+rank_map <- tm_shape(ehd_ranks) +
+  tm_fill(col = "ehd_rank",
+          palette = "BuPu",
+          style = "cat") + 
+  tm_layout(bg.color = "gray") + 
+   tm_layout(main.title = "EHD V3.0 Ranks", 
+             main.title.position = "center")
+
+print(rank_map)
+tmap_save(rank_map, "EHD Rank map using tmap.png", width = 8, height = 8, dpi = 600)
+
+```
+
+Compare: 
+```{r}
+published_ranks <- full_ehd_file |> 
+  st_drop_geometry() |> 
+  select(CensusTract2020, contains("Rank")) |> 
+  rename(ehd_Rank = Cumulative_EHD_Rank) |> 
+  rename_all(.funs = ~str_remove(., "_Rank")) |> 
+  mutate(CensusTract2020 = as.character(CensusTract2020))
+
+
+calc_ranks <- ehd_ranks |> 
+  st_drop_geometry() |> 
+  select(CensusTract2020, contains("Rank")) |> 
+  select(1:26, 33)|> 
+  rename_all(.funs = ~str_remove(., "_rank")) |> 
+  rename(LowBirthWeight = LowBirthWeight_new,
+         CardiovascularDisease = CardiovascularDisease_new,
+         )|> 
+  mutate(CensusTract2020 = as.character(CensusTract2020))
+
+all_equal(published_ranks, calc_ranks, ignore_col_order = TRUE, ignore_row_order = TRUE)
+```
+
